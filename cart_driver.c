@@ -1,0 +1,524 @@
+////////////////////////////////////////////////////////////////////////////////
+//
+//  File           : cart_driver.c
+//  Description    : This is the implementation of the standardized IO functions
+//                   for used to access the CART storage system.
+//
+//  Author         : [**Utsav**]
+//  Last Modified  : [**10/24/2016**]
+//
+
+// Includes
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+// Project Includes
+#include <cart_driver.h>
+#include <cart_controller.h>
+#include <cart_cache.h>
+
+#include "cmpsc311_log.h"
+#define MAX_FRAMES (CART_MAX_CARTRIDGES * CART_CARTRIDGE_SIZE)
+
+
+//
+// Implementation
+
+// Struct for opne file data
+typedef struct fileTableEntry {
+	char fileName[CART_MAX_PATH_LENGTH];
+	char isOpen;
+	uint32_t fileSize;
+	uint32_t *fileFrames;
+	int numFrames;
+	uint32_t filePos;
+} FileTableEntry;
+
+// Global open files table. 0 length filename denotes empty entry
+FileTableEntry FileTable[CART_MAX_TOTAL_FILES];
+
+
+// Global frames map. A frame is addressed by cartridgeIndex*frameIndex. 0 means frame is free. Non-zero means frame allocated to a file
+char FrameMap[MAX_FRAMES];
+
+CartXferRegister create_cart_opcode(uint8_t keyregisterone, uint8_t keyregistertwo, CartridgeIndex cartridgeIndex, CartFrameIndex frameIndex){
+
+	CartXferRegister tempReg;  // temporary register
+	CartXferRegister result = 0;   // result we want to return
+
+
+	// Assign the Result to the appropiate bits
+	tempReg = (CartXferRegister)frameIndex;
+	tempReg <<= 15;
+	result |= tempReg;
+	
+	tempReg = (CartXferRegister) cartridgeIndex;
+	tempReg <<= 31;
+	result |= tempReg;
+
+	tempReg = (CartXferRegister) keyregistertwo;
+	tempReg <<= 48;
+	result |= tempReg;
+
+	tempReg = (CartXferRegister) keyregisterone;
+	tempReg <<= 56;
+	result |= tempReg;
+
+	return result;
+}
+
+int extract_cart_opcode(CartXferRegister resp){
+
+   // Just extract the RT bit and return
+   if (resp & (CartXferRegister)0x0080000000000000) return 1;
+   return 0;
+
+}
+
+int allocate_frames(uint32_t *alloc, int numframes) {
+	// search through the frame map for empty frames
+	uint32_t i, numalloced = 0;
+	for (i=0;i<MAX_FRAMES;i++) {
+		if (FrameMap[i] == 0) {
+			FrameMap[i] = 1;
+			*alloc = i;
+			numalloced++;
+			if (numalloced >= numframes) break;
+			alloc++;
+		}
+	}
+	
+	if (numalloced < numframes) return -1;
+	return 0;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Function     : cart_poweron
+// Description  : Startup up the CART interface, initialize filesystem
+//
+// Inputs       : none
+// Outputs      : 0 if successful, -1 if failure
+int32_t cart_poweron(void) {
+
+	// Mark of frames as free in frame map
+	memset(FrameMap, 0, sizeof(FrameMap));
+	
+	// Init file table
+	memset(FileTable, 0, sizeof(FileTable));
+
+	// Create Register
+	CartXferRegister opregister = create_cart_opcode(CART_OP_INITMS, 0, 0, 0);
+	
+	// send
+	opregister = cart_io_bus(opregister, NULL);
+	
+	if(extract_cart_opcode(opregister) == 1){
+		logMessage(LOG_ERROR_LEVEL, "CART: init failure");		
+		return -1;
+	}
+	
+	//initialize all carts
+	int i;
+	for(i=0;i<CART_MAX_CARTRIDGES;i++){
+		opregister = create_cart_opcode(CART_OP_BZERO, 0, i, 0);
+		opregister = cart_io_bus(opregister, NULL);
+		if(extract_cart_opcode(opregister) == 1){
+			logMessage(LOG_ERROR_LEVEL, "CART: bzero failure");		
+			return -1;
+		}
+	}
+	
+	if (init_cart_cache() != 0) {
+		logMessage(LOG_ERROR_LEVEL, "CART: cache init failure");
+		return -1;
+	}
+
+	// Return successfully
+	return(0);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Function     : cart_poweroff
+// Description  : Shut down the CART interface, close all files
+//
+// Inputs       : none
+// Outputs      : 0 if successful, -1 if failure
+
+int32_t cart_poweroff(void) {
+
+	int i;
+	// close all open files
+	for(i=0;i<CART_MAX_TOTAL_FILES;i++) {
+		cart_close(i);
+	}
+	
+	// Create Register
+	CartXferRegister opregister = create_cart_opcode(CART_OP_POWOFF, 0, 0, 0);
+	// send
+	opregister = cart_io_bus(opregister, NULL);
+	if(extract_cart_opcode(opregister) == 1){
+		logMessage(LOG_ERROR_LEVEL, "CART: poweroff failure");		
+		return -1;
+	}
+
+	if (close_cart_cache() != 0) {
+		logMessage(LOG_ERROR_LEVEL, "CART: cache close 					failure");		
+		return -1;
+	}
+
+	// Return successfully
+	return(0);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Function     : cart_open
+// Description  : This function opens the file and returns a file handle
+//
+// Inputs       : path - filename of the file to open
+// Outputs      : file handle if successful, -1 if failure
+
+int16_t cart_open(char *path) {
+
+	int i, fd = -1;
+	
+	// Search file table for existing or new file.
+	for(i=0;i<CART_MAX_TOTAL_FILES;i++) {
+		// remember first empty entry for new file
+		if (FileTable[i].fileName[0] == 0) {
+			if (fd == -1) fd = i;
+			continue;
+		}
+		if (strncmp(path, FileTable[i].fileName, CART_MAX_PATH_LENGTH) == 0) {
+			if (FileTable[i].isOpen)
+				return -1;
+			fd = i;
+			break;
+		}
+	}
+	
+	if (FileTable[fd].fileName[0] == 0)
+		strncpy(FileTable[fd].fileName, path, CART_MAX_PATH_LENGTH);
+	FileTable[fd].isOpen = 1;
+	FileTable[fd].filePos = 0;
+	
+	// THIS SHOULD RETURN A FILE HANDLE
+	return (fd);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Function     : cart_close
+// Description  : This function closes the file
+//
+// Inputs       : fd - the file descriptor
+// Outputs      : 0 if successful, -1 if failure
+
+int16_t cart_close(int16_t fd) {
+
+	// check if file handle is valid
+	if ((fd < 0) || (fd >= CART_MAX_TOTAL_FILES) || !FileTable[fd].isOpen)
+		return -1;
+	
+	FileTable[fd].isOpen = 0;
+	
+	// Return successfully
+	return (0);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Function     : cart_read
+// Description  : Reads "count" bytes from the file handle "fh" into the 
+//                buffer "buf"
+//
+// Inputs       : fd - filename of the file to read from
+//                buf - pointer to buffer to read into
+//                count - number of bytes to read
+// Outputs      : bytes read if successful, -1 if failure
+
+int32_t cart_read(int16_t fd, void *buf, int32_t count) {
+
+	if ((fd < 0) || (fd >= CART_MAX_TOTAL_FILES) || !FileTable[fd].isOpen)
+		return -1;
+		
+	uint32_t rem = FileTable[fd].fileSize - FileTable[fd].filePos;
+	if (count > rem) count  = rem;
+	if (count <= 0) return 0;
+	
+	// get begin and end frames and offsets
+	int bframe = FileTable[fd].filePos / CART_FRAME_SIZE;
+	int boffset = FileTable[fd].filePos % CART_FRAME_SIZE;
+	int eframe = (FileTable[fd].filePos + count) / CART_FRAME_SIZE;
+	int eoffset = (FileTable[fd].filePos + count) % CART_FRAME_SIZE;
+	
+	int currcart = FileTable[fd].fileFrames[bframe]/CART_CARTRIDGE_SIZE;
+	CartXferRegister opregister = create_cart_opcode(CART_OP_LDCART, 0, currcart, 0);
+	opregister = cart_io_bus(opregister, NULL);
+	if(extract_cart_opcode(opregister) == 1){
+		logMessage(LOG_ERROR_LEVEL, "CART: load failure");		
+		return -1;
+	}
+
+	char *rbuff;
+	char tbuff[CART_FRAME_SIZE];
+	if ((rbuff = get_cart_cache(currcart, FileTable[fd].fileFrames[bframe]%CART_CARTRIDGE_SIZE)) == NULL)
+	{		
+		rbuff = tbuff;
+		opregister = create_cart_opcode(CART_OP_RDFRME, 0, 0, FileTable[fd].fileFrames[bframe]%CART_CARTRIDGE_SIZE);
+		
+		opregister = cart_io_bus(opregister, rbuff);
+		if(extract_cart_opcode(opregister) == 1){
+			logMessage(LOG_ERROR_LEVEL, "CART: read failure");	
+			return -1;
+		}
+	}
+	
+	if (bframe == eframe) {
+		memcpy(buf, rbuff + boffset, eoffset - boffset);
+		FileTable[fd].filePos += count;
+		return count;
+	}
+	int bread = CART_FRAME_SIZE - boffset;
+	memcpy(buf, rbuff + boffset, bread);
+	
+	//read all full frames
+	int i, cart;
+	for (i=bframe+1;i<eframe;i++) {
+		cart = FileTable[fd].fileFrames[i]/CART_CARTRIDGE_SIZE;
+		if (cart != currcart) {
+			opregister = create_cart_opcode(CART_OP_LDCART, 0, cart, 0);
+			opregister = cart_io_bus(opregister, NULL);
+			if(extract_cart_opcode(opregister) == 1){
+				logMessage(LOG_ERROR_LEVEL, "CART: load failure");		
+				return -1;
+			}
+			currcart = cart;
+		}
+		if ((rbuff = get_cart_cache(currcart, FileTable[fd].fileFrames[bframe]%CART_CARTRIDGE_SIZE)) != NULL)
+		{
+			memcpy(buf+bread, rbuff, CART_FRAME_SIZE);
+		}
+		else
+		{	
+			opregister = create_cart_opcode(CART_OP_RDFRME, 0, 0, FileTable[fd].fileFrames[i]%CART_CARTRIDGE_SIZE);
+			opregister = cart_io_bus(opregister, buf+bread);
+			if(extract_cart_opcode(opregister) == 1){
+				logMessage(LOG_ERROR_LEVEL, "CART: read failure");	
+				return -1;
+			}
+		}
+		bread += CART_FRAME_SIZE;
+	}
+	
+	if (eoffset == 0) {
+		FileTable[fd].filePos += count;
+		return count;
+	}
+	
+	cart = FileTable[fd].fileFrames[eframe]/CART_CARTRIDGE_SIZE;
+	if (cart != currcart) {
+		opregister = create_cart_opcode(CART_OP_LDCART, 0, cart, 0);
+		opregister = cart_io_bus(opregister, NULL);
+		if(extract_cart_opcode(opregister) == 1){
+			logMessage(LOG_ERROR_LEVEL, "CART: load failure");		
+			return -1;
+		}
+		currcart = cart;
+	}
+	if ((rbuff = get_cart_cache(currcart, FileTable[fd].fileFrames[bframe]%CART_CARTRIDGE_SIZE)) == NULL) {
+		rbuff = tbuff;
+		opregister = create_cart_opcode(CART_OP_RDFRME, 0, 0, FileTable[fd].fileFrames[eframe]%CART_CARTRIDGE_SIZE);
+		opregister = cart_io_bus(opregister, rbuff);
+		if(extract_cart_opcode(opregister) == 1){
+			logMessage(LOG_ERROR_LEVEL, "CART: read failure");	
+			return -1;
+		}
+	}
+	memcpy(buf+bread, rbuff, eoffset);
+	FileTable[fd].filePos += count;
+	// Return successfully
+	return (count);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Function     : cart_write
+// Description  : Writes "count" bytes to the file handle "fh" from the 
+//                buffer  "buf"
+//
+// Inputs       : fd - filename of the file to write to
+//                buf - pointer to buffer to write from
+//                count - number of bytes to write
+// Outputs      : bytes written if successful, -1 if failure
+
+int32_t cart_write(int16_t fd, void *buf, int32_t count) {
+
+	if ((fd < 0) || (fd >= CART_MAX_TOTAL_FILES) || !FileTable[fd].isOpen)
+		return -1;
+		
+	uint32_t rem = FileTable[fd].fileSize - FileTable[fd].filePos;
+	if (count > rem) {
+		// additional space need to be allocated.
+		int req = count - rem;
+		int partframesz = FileTable[fd].fileSize % CART_FRAME_SIZE;
+		if (partframesz > 0) {
+			// last frame has space left. subract from req.
+			req -= (CART_FRAME_SIZE - partframesz);
+		}
+		
+		if (req > 0) {
+			int numframes = req / CART_FRAME_SIZE;
+			if ((req % CART_FRAME_SIZE) > 0) numframes++;
+			int allocidx = FileTable[fd].fileSize / CART_FRAME_SIZE;
+			if (partframesz > 0) allocidx++;
+			
+			if((allocidx + numframes) >= FileTable[fd].numFrames) 				{
+			FileTable[fd].numFrames = (((allocidx + numframes)/128)+ 1) * 128;
+				FileTable[fd].fileFrames = realloc(FileTable[fd].fileFrames, FileTable[fd].numFrames * sizeof(uint32_t));
+				if (FileTable[fd].fileFrames == NULL) {
+					logMessage(LOG_ERROR_LEVEL, "Frame Alloc Failure");						
+				return -1;
+
+				}
+				
+			}
+			if (allocate_frames(FileTable[fd].fileFrames + allocidx, numframes) != 0) {
+				logMessage(LOG_ERROR_LEVEL, "CART: alloc failure");	
+				return -1;
+			}
+		}
+		
+		FileTable[fd].fileSize += (count - rem);
+	}
+	
+	// get begin and end frames and offsets
+	int bframe = FileTable[fd].filePos / CART_FRAME_SIZE;
+	int boffset = FileTable[fd].filePos % CART_FRAME_SIZE;
+	int eframe = (FileTable[fd].filePos + count) / CART_FRAME_SIZE;
+	int eoffset = (FileTable[fd].filePos + count) % CART_FRAME_SIZE;
+	
+	int currcart = FileTable[fd].fileFrames[bframe]/CART_CARTRIDGE_SIZE;
+	CartXferRegister opregister = create_cart_opcode(CART_OP_LDCART, 0, currcart, 0);
+	opregister = cart_io_bus(opregister, NULL);
+	if(extract_cart_opcode(opregister) == 1){
+		logMessage(LOG_ERROR_LEVEL, "CART: load failure");		
+		return -1;
+	}
+	char *rbuff;
+	char tbuff[CART_FRAME_SIZE];
+	if ((rbuff = get_cart_cache(currcart, FileTable[fd].fileFrames[bframe]%CART_CARTRIDGE_SIZE)) == NULL) {
+		rbuff = tbuff;
+		opregister = create_cart_opcode(CART_OP_RDFRME, 0, 0, FileTable[fd].fileFrames[bframe]%CART_CARTRIDGE_SIZE);
+	
+		opregister = cart_io_bus(opregister, rbuff);
+		if(extract_cart_opcode(opregister) == 1){
+			logMessage(LOG_ERROR_LEVEL, "CART: read failure");	
+			return -1;
+		}
+	}
+	
+	int bwrit;
+	if (bframe == eframe) {
+		bwrit = eoffset - boffset;
+	}
+	else {
+		bwrit = CART_FRAME_SIZE - boffset;
+	}
+	
+	memcpy(rbuff + boffset, buf, bwrit);
+	put_cart_cache(currcart, FileTable[fd].fileFrames[bframe]%CART_CARTRIDGE_SIZE, rbuff);
+	opregister = create_cart_opcode(CART_OP_WRFRME, 0, 0, FileTable[fd].fileFrames[bframe]%CART_CARTRIDGE_SIZE);
+	opregister = cart_io_bus(opregister, rbuff);
+	if(extract_cart_opcode(opregister) == 1){
+		logMessage(LOG_ERROR_LEVEL, "CART: write failure");		
+		return -1;
+	}
+	
+	if (bframe == eframe) {
+		FileTable[fd].filePos += count;
+		return count;
+	}
+	
+	//write all full frames
+	int i, cart;
+	for (i=bframe+1;i<eframe;i++) {
+		cart = FileTable[fd].fileFrames[i]/CART_CARTRIDGE_SIZE;
+		if (cart != currcart) {
+			opregister = create_cart_opcode(CART_OP_LDCART, 0, cart, 0);
+			opregister = cart_io_bus(opregister, NULL);
+			if(extract_cart_opcode(opregister) == 1){
+				logMessage(LOG_ERROR_LEVEL, "CART: load failure");		
+				return -1;
+			}
+			currcart = cart;
+		}
+		put_cart_cache(currcart, FileTable[fd].fileFrames[bframe]%CART_CARTRIDGE_SIZE, buf+bwrit);
+		opregister = create_cart_opcode(CART_OP_WRFRME, 0, 0, FileTable[fd].fileFrames[i]%CART_CARTRIDGE_SIZE);
+		opregister = cart_io_bus(opregister, buf+bwrit);
+		if(extract_cart_opcode(opregister) == 1){
+			logMessage(LOG_ERROR_LEVEL, "CART: read failure");	
+			return -1;
+		}
+		bwrit += CART_FRAME_SIZE;
+	}
+	
+	if (eoffset == 0) {
+		FileTable[fd].filePos += count;
+		return count;
+	}
+	
+	cart = FileTable[fd].fileFrames[eframe]/CART_CARTRIDGE_SIZE;
+	if (cart != currcart) {
+		opregister = create_cart_opcode(CART_OP_LDCART, 0, cart, 0);
+		opregister = cart_io_bus(opregister, NULL);
+		if(extract_cart_opcode(opregister) == 1){
+			logMessage(LOG_ERROR_LEVEL, "CART: load failure");		
+			return -1;
+		}
+		currcart = cart;
+	}
+	
+	if ((rbuff = get_cart_cache(currcart, FileTable[fd].fileFrames[bframe]%CART_CARTRIDGE_SIZE)) == NULL) {
+		rbuff = tbuff;
+		opregister = create_cart_opcode(CART_OP_RDFRME, 0, 0, FileTable[fd].fileFrames[eframe]%CART_CARTRIDGE_SIZE);
+		opregister = cart_io_bus(opregister, rbuff);
+		if(extract_cart_opcode(opregister) == 1){
+			logMessage(LOG_ERROR_LEVEL, "CART: read failure");	
+			return -1;
+		}
+	}
+	memcpy(rbuff, buf+bwrit, eoffset);
+	put_cart_cache(currcart, FileTable[fd].fileFrames[bframe]%CART_CARTRIDGE_SIZE, rbuff);
+	opregister = create_cart_opcode(CART_OP_WRFRME, 0, 0, FileTable[fd].fileFrames[eframe]%CART_CARTRIDGE_SIZE);
+	opregister = cart_io_bus(opregister, rbuff);
+	if(extract_cart_opcode(opregister) == 1){
+		logMessage(LOG_ERROR_LEVEL, "CART: write failure");		
+		return -1;
+	}
+	FileTable[fd].filePos += count;
+	// Return successfully
+	return (count);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Function     : cart_seek
+// Description  : Seek to specific point in the file
+//
+// Inputs       : fd - filename of the file to write to
+//                loc - offfset of file in relation to beginning of file
+// Outputs      : 0 if successful, -1 if failure
+
+int32_t cart_seek(int16_t fd, uint32_t loc) {
+
+	if ((fd < 0) || (fd >= CART_MAX_TOTAL_FILES) || !FileTable[fd].isOpen)
+		return -1;
+		
+	if (loc > FileTable[fd].fileSize) return -1;
+	FileTable[fd].filePos = loc;
+	// Return successfully
+	return (0);
+}
